@@ -18,11 +18,12 @@
  * - Skips labels listed in LABEL_SKIP_LIST
  * - Skips descendants of labels listed in OFFSPRING_SKIP_LIST
  * - Optional filtering based on Gmail system labels/search operators
+ * - Processes messages incrementally page by page
+ * - Resumes mid-query using Gmail pageToken
  * - Uses batchModify for performance
  * - Chunks batchModify to Gmail API's 1000-ID limit
- * - Retries failed batchModify chunks with exponential backoff
- * - Catches per-batch errors so one failed chunk does not stop the whole run
- * - Stops after MAX_MESSAGES_PER_RUN to reduce Apps Script timeout risk
+ * - Retries failed messages.list and batchModify calls with exponential backoff
+ * - Stops when message cap or time budget is reached
  * - Automatically schedules continuation runs for large backlogs
  *
  * Requirements
@@ -36,7 +37,7 @@
  * - Only user labels are processed as source labels.
  * - System labels are ignored as source labels.
  * - The script adds missing ancestor labels but never removes labels.
- * - Continuation resumes at the next label/ancestor pair, not mid-query page.
+ * - Continuation can resume at the exact label/ancestor/pageToken position.
  */
 
 /* ========================================================================== */
@@ -74,40 +75,10 @@ const LABEL_SKIP_LIST = [
  * These are appended to every Gmail search query used to find messages
  * that need ancestor labels added.
  *
- * Notes:
- * - These values should use valid Gmail search syntax labels/operators.
- * - Examples:
- *     "UNREAD"
- *     "STARRED"
- *     "IMPORTANT"
- *     "INBOX"
- *     "SENT"
- *     "DRAFT"
- *     "SPAM"
- *     "TRASH"
- *     "CATEGORY_PERSONAL"
- *     "CATEGORY_SOCIAL"
- *     "CATEGORY_PROMOTIONS"
- *     "CATEGORY_UPDATES"
- *     "CATEGORY_FORUMS"
- *
- * Behavior:
- * - REQUIRED_SYSTEM_LABELS_ANY:
- *     At least one must match. Combined as: (label:X OR label:Y ...)
- * - REQUIRED_SYSTEM_LABELS_ALL:
- *     All must match. Combined as: label:X label:Y ...
- * - EXCLUDED_SYSTEM_LABELS:
- *     None may match. Combined as: -label:X -label:Y ...
- *
- * Example:
- *   Only unread inbox mail:
- *     REQUIRED_SYSTEM_LABELS_ALL = ["UNREAD", "INBOX"]
- *
- *   Only unread or starred mail:
- *     REQUIRED_SYSTEM_LABELS_ANY = ["UNREAD", "STARRED"]
- *
- *   Skip trash and spam:
- *     EXCLUDED_SYSTEM_LABELS = ["TRASH", "SPAM"]
+ * Examples:
+ *   REQUIRED_SYSTEM_LABELS_ALL = ["UNREAD", "INBOX"]
+ *   REQUIRED_SYSTEM_LABELS_ANY = ["UNREAD", "STARRED"]
+ *   EXCLUDED_SYSTEM_LABELS = ["TRASH", "SPAM"]
  */
 const REQUIRED_SYSTEM_LABELS_ANY = [
   // "UNREAD",
@@ -152,10 +123,18 @@ const BATCH_MODIFY_SIZE = 1000;
 /**
  * Safety cap for one execution.
  *
- * Once this many messages have been scheduled for update in a run, the script
- * stops and schedules a continuation trigger so the next execution can continue.
+ * Once this many messages have been updated in a run, the script stops and
+ * schedules a continuation.
  */
-const MAX_MESSAGES_PER_RUN = 10000;
+const MAX_MESSAGES_PER_RUN = 2000;
+
+/**
+ * Soft execution budget in milliseconds.
+ *
+ * Stop before Apps Script's hard runtime limit so state can be saved and
+ * a continuation trigger can be scheduled cleanly.
+ */
+const MAX_RUNTIME_MS = 4.5 * 60 * 1000; // 4.5 minutes
 
 /**
  * Delay before continuation trigger fires, in milliseconds.
@@ -163,18 +142,10 @@ const MAX_MESSAGES_PER_RUN = 10000;
 const CONTINUATION_DELAY_MS = 60 * 1000;
 
 /**
- * Retry configuration for failed batchModify chunks.
- *
- * The script retries transient failures with exponential backoff:
- *   delay = RETRY_INITIAL_DELAY_MS * 2^(attempt - 1)
- *
- * Example with defaults:
- *   attempt 1 retry -> 1 second
- *   attempt 2 retry -> 2 seconds
- *   attempt 3 retry -> 4 seconds
+ * Retry configuration for transient API failures.
  */
-const RETRY_MAX_ATTEMPTS = 4;
-const RETRY_INITIAL_DELAY_MS = 1000;
+const RETRY_MAX_ATTEMPTS = 3;
+const RETRY_INITIAL_DELAY_MS = 500;
 
 /**
  * Prefix used for state stored in Script Properties.
@@ -204,8 +175,8 @@ function addParentLabel() {
 /**
  * Continuation entrypoint.
  *
- * Called by a time-based trigger when a prior run hit the per-run cap and
- * scheduled a continuation.
+ * Called by a time-based trigger when a prior run hit the message cap or time
+ * budget and scheduled a continuation.
  */
 function resumeAddParentLabel() {
   runAddParentLabel({ resume: true });
@@ -218,22 +189,11 @@ function resumeAddParentLabel() {
 /**
  * Core runner for both fresh and resumed executions.
  *
- * Workflow:
- * 1. Load Gmail labels
- * 2. Validate skip lists
- * 3. Validate system-label filters
- * 4. Build eligible nested user labels
- * 5. Walk each label and each ancestor
- * 6. Find messages that have child label but not ancestor label
- * 7. Optionally restrict by system-label filters
- * 8. Add missing ancestor label in batches of up to 1000
- * 9. Stop early if MAX_MESSAGES_PER_RUN is reached
- * 10. Save continuation state and schedule next trigger if needed
- *
  * @param {Object} options
  * @param {boolean} options.resume Whether this run is resuming from saved state
  */
 function runAddParentLabel(options) {
+  const startedAt = Date.now();
   const logLevel = normalizeLogLevel(LOG_LEVEL);
   const resume = Boolean(options && options.resume);
 
@@ -295,7 +255,8 @@ function runAddParentLabel(options) {
   if (resume) {
     if (savedState) {
       logInfo(
-        `Resuming from label index ${startPosition.labelIndex + 1}, ancestor index ${startPosition.ancestorIndex + 1}.`
+        `Resuming from label index ${startPosition.labelIndex + 1}, ancestor index ${startPosition.ancestorIndex + 1}` +
+        `${startPosition.pageToken ? " with saved pageToken." : "."}`
       );
     } else {
       logInfo("No saved continuation state found. Starting from the beginning.");
@@ -307,7 +268,8 @@ function runAddParentLabel(options) {
   let totalMessagesTouched = 0;
   let totalBatchCalls = 0;
   let totalBatchFailures = 0;
-  let hitRunCap = false;
+  let totalListFailures = 0;
+  let stoppedEarly = false;
   let nextState = null;
 
   for (let labelIndex = startPosition.labelIndex; labelIndex < eligibleLabels.length; labelIndex++) {
@@ -319,12 +281,12 @@ function runAddParentLabel(options) {
       continue;
     }
 
+    const ancestorStartIndex =
+      labelIndex === startPosition.labelIndex ? startPosition.ancestorIndex : 0;
+
     if (logLevel >= 3) {
       logDebug(`Checking "${label.name}" with ancestors: ${ancestorNames.join(", ")}`);
     }
-
-    const ancestorStartIndex =
-      labelIndex === startPosition.labelIndex ? startPosition.ancestorIndex : 0;
 
     for (let ancestorIndex = ancestorStartIndex; ancestorIndex < ancestorNames.length; ancestorIndex++) {
       const ancestorName = ancestorNames[ancestorIndex];
@@ -335,64 +297,86 @@ function runAddParentLabel(options) {
         continue;
       }
 
-      const query = buildMessageSearchQuery(label.name, ancestorName, systemFilterQuery);
-      const messageIds = listAllMessageIds(query);
-
-      if (messageIds.length === 0) {
-        if (logLevel >= 3) {
-          logDebug(`No messages missing "${ancestorName}" for "${label.name}".`);
-        }
-        continue;
-      }
-
-      if (
-        totalMessagesTouched > 0 &&
-        totalMessagesTouched + messageIds.length > MAX_MESSAGES_PER_RUN
-      ) {
-        hitRunCap = true;
-        nextState = buildContinuationState(label.name, ancestorName, labelIndex, ancestorIndex);
+      if (shouldStopNow(startedAt, totalMessagesTouched)) {
+        stoppedEarly = true;
+        nextState = buildContinuationState(
+          label.name,
+          ancestorName,
+          labelIndex,
+          ancestorIndex,
+          null
+        );
         logInfo(
-          `Per-run cap reached before processing "${label.name}" -> "${ancestorName}". Scheduling continuation.`
+          `Stopping before processing "${label.name}" -> "${ancestorName}" due to time/message budget. ` +
+          `No messages for this pair were changed in this run. Scheduling continuation.`
         );
         break;
       }
 
-      if (DRY_RUN) {
-        logInfo(`[DRY RUN] Would add "${ancestorName}" to ${messageIds.length} message(s) labeled "${label.name}".`);
-        totalMessagesTouched += messageIds.length;
+      const query = buildMessageSearchQuery(label.name, ancestorName, systemFilterQuery);
+
+      const startingPageToken =
+        labelIndex === startPosition.labelIndex && ancestorIndex === startPosition.ancestorIndex
+          ? startPosition.pageToken
+          : null;
+
+      const remainingBudget = MAX_MESSAGES_PER_RUN - totalMessagesTouched;
+
+      const result = DRY_RUN
+        ? processQueryPagedDryRun(query, startedAt, remainingBudget, startingPageToken)
+        : processQueryPaged(query, ancestorLabel.id, startedAt, remainingBudget, startingPageToken);
+
+      totalListFailures += result.listFailureCount || 0;
+      totalBatchCalls += result.batchCount || 0;
+      totalBatchFailures += result.failureCount || 0;
+      totalMessagesTouched += result.touchedCount || 0;
+
+      if (result.touchedCount > 0) {
         updateGroups += 1;
-      } else {
-        const result = batchModifyMessagesSafe(messageIds, [ancestorLabel.id], []);
-        totalBatchCalls += result.batchCount;
-        totalBatchFailures += result.failureCount;
-        totalMessagesTouched += messageIds.length;
-        updateGroups += 1;
+
+        if (DRY_RUN) {
+          logInfo(
+            `[DRY RUN] Would add "${ancestorName}" to ${result.touchedCount} message(s) labeled "${label.name}".`
+          );
+        } else {
+          logInfo(
+            `Added "${ancestorName}" to ${result.touchedCount} message(s) labeled "${label.name}" ` +
+            `in ${result.batchCount} batch(es)` +
+            `${result.failureCount > 0 ? ` with ${result.failureCount} failed batch(es)` : ""}.`
+          );
+        }
+
+        if (logLevel >= 2 && result.previewIds && result.previewIds.length > 0) {
+          logVerbose(buildMessagePreview(label.name, ancestorName, result.previewIds));
+        }
+      } else if (result.completed && logLevel >= 3) {
+        logDebug(`No messages missing "${ancestorName}" for "${label.name}".`);
+      }
+
+      if (!result.completed) {
+        stoppedEarly = true;
+        nextState = buildContinuationState(
+          label.name,
+          ancestorName,
+          labelIndex,
+          ancestorIndex,
+          result.nextPageToken || null
+        );
 
         logInfo(
-          `Added "${ancestorName}" to ${messageIds.length} message(s) labeled "${label.name}" ` +
-          `in ${result.batchCount} batch(es)` +
-          `${result.failureCount > 0 ? ` with ${result.failureCount} failed batch(es)` : ""}.`
+          `Stopped partway through "${label.name}" -> "${ancestorName}" due to time/message budget. ` +
+          `Scheduling continuation from the saved page position.`
         );
-      }
-
-      if (logLevel >= 2) {
-        logVerbose(buildMessagePreview(label.name, ancestorName, messageIds));
-      }
-
-      if (totalMessagesTouched >= MAX_MESSAGES_PER_RUN) {
-        hitRunCap = true;
-        nextState = buildNextPositionAfterCurrent(eligibleLabels, labelIndex, ancestorNames, ancestorIndex);
-        logInfo("Per-run cap reached. Scheduling continuation.");
         break;
       }
     }
 
-    if (hitRunCap) {
+    if (stoppedEarly) {
       break;
     }
   }
 
-  if (hitRunCap && nextState) {
+  if (stoppedEarly && nextState) {
     saveContinuationState(nextState);
     scheduleContinuationTrigger();
   } else {
@@ -400,7 +384,7 @@ function runAddParentLabel(options) {
     deleteContinuationTriggers();
   }
 
-  if (totalMessagesTouched === 0 && !hitRunCap) {
+  if (totalMessagesTouched === 0 && !stoppedEarly) {
     logInfo("All labeled messages already included the labels of their ancestors.");
     return;
   }
@@ -408,7 +392,10 @@ function runAddParentLabel(options) {
   logInfo(
     `${DRY_RUN ? "[DRY RUN] " : ""}Done. Checked ${labelsChecked} label(s), ` +
     `performed ${updateGroups} update group(s), touched ${totalMessagesTouched} message(s)` +
-    `${DRY_RUN ? "." : `, across ${totalBatchCalls} batchModify call(s), with ${totalBatchFailures} failed batch(es).`}`
+    `${DRY_RUN
+      ? `, with ${totalListFailures} messages.list failure(s).`
+      : `, across ${totalBatchCalls} batchModify call(s), with ${totalBatchFailures} failed batch(es) and ${totalListFailures} messages.list failure(s).`
+    }`
   );
 }
 
@@ -443,10 +430,6 @@ function buildMessageSearchQuery(childLabelName, ancestorLabelName, systemFilter
 /**
  * Build the optional Gmail search clause for configured system-label filters.
  *
- * Examples of output:
- *   label:"UNREAD" label:"INBOX" -label:"TRASH" -label:"SPAM"
- *   {label:"UNREAD" label:"STARRED"} -label:"TRASH"
- *
  * @returns {string} Gmail search fragment, or empty string if no filters
  */
 function buildSystemLabelFilterQuery() {
@@ -478,9 +461,6 @@ function buildSystemLabelFilterQuery() {
 /**
  * Validate configured system-label filters against the system labels returned
  * by the Gmail Labels API.
- *
- * This is helpful for catching typos, though some Gmail search operators may
- * still be valid even if they do not appear in label listings exactly as typed.
  *
  * @param {Set<string>} systemLabelNameSet Known system labels from Gmail
  */
@@ -543,10 +523,6 @@ function getAncestorNames(labelName) {
 /**
  * Determine whether a label should be skipped and why.
  *
- * Rules:
- * - Exact match in LABEL_SKIP_LIST => skip
- * - Descendant of any OFFSPRING_SKIP_LIST entry => skip
- *
  * @param {string} labelName Label to test
  * @param {Set<string>} skippedLabels Exact labels to skip
  * @param {string[]} skippedAncestors Ancestor labels whose descendants are skipped
@@ -567,42 +543,368 @@ function getSkipReason(labelName, skippedLabels, skippedAncestors) {
 }
 
 /* ========================================================================== */
-/* Gmail message search and modify                                             */
+/* Incremental Gmail processing                                                */
 /* ========================================================================== */
 
 /**
- * Return all message IDs matching a Gmail search query.
+ * Return true when the current run should stop soon.
  *
- * Uses Gmail.Users.Messages.list with pagination until all result pages
- * have been fetched.
+ * @param {number} startedAt Epoch milliseconds when the run began
+ * @param {number} totalMessagesTouched Number of messages updated so far in this run
+ * @returns {boolean}
+ */
+function shouldStopNow(startedAt, totalMessagesTouched) {
+  return (
+    totalMessagesTouched >= MAX_MESSAGES_PER_RUN ||
+    Date.now() - startedAt >= MAX_RUNTIME_MS
+  );
+}
+
+/**
+ * Process one label/ancestor query incrementally, page by page.
+ *
+ * This is the key timeout fix:
+ * - it does not collect all IDs first
+ * - it processes each page immediately
+ * - it stops cleanly if time/message budget is reached
+ * - it returns nextPageToken so the next run resumes the same query
  *
  * @param {string} query Gmail search query
- * @returns {string[]} Matching message IDs
+ * @param {string} ancestorLabelId Label ID to add
+ * @param {number} startedAt Epoch milliseconds when the run began
+ * @param {number} remainingMessageBudget Remaining per-run message budget
+ * @param {string|null} startingPageToken Saved page token for continuation
+ * @returns {{
+ *   touchedCount: number,
+ *   batchCount: number,
+ *   failureCount: number,
+ *   listFailureCount: number,
+ *   completed: boolean,
+ *   nextPageToken: (string|null),
+ *   previewIds: string[]
+ * }}
  */
-function listAllMessageIds(query) {
-  const ids = [];
-  let pageToken = null;
+function processQueryPaged(query, ancestorLabelId, startedAt, remainingMessageBudget, startingPageToken) {
+  let pageToken = startingPageToken || null;
+  let touchedCount = 0;
+  let batchCount = 0;
+  let failureCount = 0;
+  let listFailureCount = 0;
+  const previewIds = [];
 
-  do {
-    const response = Gmail.Users.Messages.list("me", {
-      q: query,
-      pageToken: pageToken,
-      maxResults: SEARCH_PAGE_SIZE,
-    });
+  while (true) {
+    if (shouldStopNow(startedAt, touchedCount)) {
+      return {
+        touchedCount,
+        batchCount,
+        failureCount,
+        listFailureCount,
+        completed: false,
+        nextPageToken: pageToken,
+        previewIds,
+      };
+    }
 
-    const messages = response.messages || [];
-    ids.push(...messages.map(message => message.id));
-    pageToken = response.nextPageToken || null;
-  } while (pageToken);
+    if (touchedCount >= remainingMessageBudget) {
+      return {
+        touchedCount,
+        batchCount,
+        failureCount,
+        listFailureCount,
+        completed: false,
+        nextPageToken: pageToken,
+        previewIds,
+      };
+    }
 
-  return ids;
+    const listResult = retryListMessagesPage(query, pageToken);
+
+    if (!listResult.ok) {
+      listFailureCount += 1;
+
+      return {
+        touchedCount,
+        batchCount,
+        failureCount,
+        listFailureCount,
+        completed: touchedCount > 0 ? false : true,
+        nextPageToken: pageToken,
+        previewIds,
+      };
+    }
+
+    const response = listResult.response;
+    const messages = Array.isArray(response.messages) ? response.messages : [];
+    const nextPageToken = response.nextPageToken || null;
+
+    if (messages.length === 0) {
+      return {
+        touchedCount,
+        batchCount,
+        failureCount,
+        listFailureCount,
+        completed: true,
+        nextPageToken: null,
+        previewIds,
+      };
+    }
+
+    const roomLeft = remainingMessageBudget - touchedCount;
+    const limitedMessages = messages.slice(0, roomLeft);
+    const ids = limitedMessages.map(message => message.id);
+
+    if (previewIds.length < 20) {
+      const needed = 20 - previewIds.length;
+      previewIds.push(...ids.slice(0, needed));
+    }
+
+    const batchResult = batchModifyMessagesSafe(ids, [ancestorLabelId], []);
+    touchedCount += ids.length;
+    batchCount += batchResult.batchCount;
+    failureCount += batchResult.failureCount;
+
+    if (limitedMessages.length < messages.length) {
+      return {
+        touchedCount,
+        batchCount,
+        failureCount,
+        listFailureCount,
+        completed: false,
+        nextPageToken: pageToken,
+        previewIds,
+      };
+    }
+
+    if (shouldStopNow(startedAt, touchedCount)) {
+      return {
+        touchedCount,
+        batchCount,
+        failureCount,
+        listFailureCount,
+        completed: false,
+        nextPageToken: nextPageToken,
+        previewIds,
+      };
+    }
+
+    if (!nextPageToken) {
+      return {
+        touchedCount,
+        batchCount,
+        failureCount,
+        listFailureCount,
+        completed: true,
+        nextPageToken: null,
+        previewIds,
+      };
+    }
+
+    pageToken = nextPageToken;
+  }
+}
+
+/**
+ * Dry-run version of processQueryPaged.
+ *
+ * Reads query pages incrementally and counts what would be processed, but does
+ * not modify any messages.
+ *
+ * @param {string} query Gmail search query
+ * @param {number} startedAt Epoch milliseconds when the run began
+ * @param {number} remainingMessageBudget Remaining per-run message budget
+ * @param {string|null} startingPageToken Saved page token for continuation
+ * @returns {{
+ *   touchedCount: number,
+ *   batchCount: number,
+ *   failureCount: number,
+ *   listFailureCount: number,
+ *   completed: boolean,
+ *   nextPageToken: (string|null),
+ *   previewIds: string[]
+ * }}
+ */
+function processQueryPagedDryRun(query, startedAt, remainingMessageBudget, startingPageToken) {
+  let pageToken = startingPageToken || null;
+  let touchedCount = 0;
+  let listFailureCount = 0;
+  const previewIds = [];
+
+  while (true) {
+    if (shouldStopNow(startedAt, touchedCount)) {
+      return {
+        touchedCount,
+        batchCount: 0,
+        failureCount: 0,
+        listFailureCount,
+        completed: false,
+        nextPageToken: pageToken,
+        previewIds,
+      };
+    }
+
+    if (touchedCount >= remainingMessageBudget) {
+      return {
+        touchedCount,
+        batchCount: 0,
+        failureCount: 0,
+        listFailureCount,
+        completed: false,
+        nextPageToken: pageToken,
+        previewIds,
+      };
+    }
+
+    const listResult = retryListMessagesPage(query, pageToken);
+
+    if (!listResult.ok) {
+      listFailureCount += 1;
+
+      return {
+        touchedCount,
+        batchCount: 0,
+        failureCount: 0,
+        listFailureCount,
+        completed: touchedCount > 0 ? false : true,
+        nextPageToken: pageToken,
+        previewIds,
+      };
+    }
+
+    const response = listResult.response;
+    const messages = Array.isArray(response.messages) ? response.messages : [];
+    const nextPageToken = response.nextPageToken || null;
+
+    if (messages.length === 0) {
+      return {
+        touchedCount,
+        batchCount: 0,
+        failureCount: 0,
+        listFailureCount,
+        completed: true,
+        nextPageToken: null,
+        previewIds,
+      };
+    }
+
+    const roomLeft = remainingMessageBudget - touchedCount;
+    const limitedMessages = messages.slice(0, roomLeft);
+    const ids = limitedMessages.map(message => message.id);
+
+    touchedCount += ids.length;
+
+    if (previewIds.length < 20) {
+      const needed = 20 - previewIds.length;
+      previewIds.push(...ids.slice(0, needed));
+    }
+
+    if (limitedMessages.length < messages.length) {
+      return {
+        touchedCount,
+        batchCount: 0,
+        failureCount: 0,
+        listFailureCount,
+        completed: false,
+        nextPageToken: pageToken,
+        previewIds,
+      };
+    }
+
+    if (shouldStopNow(startedAt, touchedCount)) {
+      return {
+        touchedCount,
+        batchCount: 0,
+        failureCount: 0,
+        listFailureCount,
+        completed: false,
+        nextPageToken: nextPageToken,
+        previewIds,
+      };
+    }
+
+    if (!nextPageToken) {
+      return {
+        touchedCount,
+        batchCount: 0,
+        failureCount: 0,
+        listFailureCount,
+        completed: true,
+        nextPageToken: null,
+        previewIds,
+      };
+    }
+
+    pageToken = nextPageToken;
+  }
+}
+
+/**
+ * Retry a single Gmail.Users.Messages.list call using exponential backoff.
+ *
+ * @param {string} query Gmail search query
+ * @param {string|null} pageToken Gmail page token
+ * @returns {{ok:boolean, response:(Object|null)}}
+ */
+function retryListMessagesPage(query, pageToken) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = Gmail.Users.Messages.list("me", {
+        q: query,
+        pageToken: pageToken || null,
+        maxResults: SEARCH_PAGE_SIZE,
+      });
+
+      if (!response) {
+        if (attempt === RETRY_MAX_ATTEMPTS) {
+          logInfo(
+            `messages.list returned an empty response after ${RETRY_MAX_ATTEMPTS} attempt(s)` +
+            ` for query: ${query}${pageToken ? ` (pageToken: ${pageToken})` : ""}`
+          );
+          return { ok: false, response: null };
+        }
+
+        const delayMs = RETRY_INITIAL_DELAY_MS * Math.pow(2, attempt - 1);
+        logInfo(
+          `messages.list returned an empty response on attempt ${attempt}/${RETRY_MAX_ATTEMPTS}` +
+          ` for query: ${query}${pageToken ? ` (pageToken: ${pageToken})` : ""}. Retrying in ${delayMs} ms.`
+        );
+        Utilities.sleep(delayMs);
+        continue;
+      }
+
+      return { ok: true, response: response };
+    } catch (err) {
+      lastError = err;
+      const message = err && err.message ? err.message : String(err);
+
+      if (attempt === RETRY_MAX_ATTEMPTS) {
+        logInfo(
+          `messages.list failed permanently after ${RETRY_MAX_ATTEMPTS} attempt(s)` +
+          ` for query: ${query}${pageToken ? ` (pageToken: ${pageToken})` : ""}: ${message}`
+        );
+        return { ok: false, response: null };
+      }
+
+      const delayMs = RETRY_INITIAL_DELAY_MS * Math.pow(2, attempt - 1);
+      logInfo(
+        `messages.list failed on attempt ${attempt}/${RETRY_MAX_ATTEMPTS}` +
+        ` for query: ${query}${pageToken ? ` (pageToken: ${pageToken})` : ""}: ${message}.` +
+        ` Retrying in ${delayMs} ms.`
+      );
+      Utilities.sleep(delayMs);
+    }
+  }
+
+  logDebug(
+    `messages.list last error: ${lastError && lastError.message ? lastError.message : lastError}`
+  );
+
+  return { ok: false, response: null };
 }
 
 /**
  * Add/remove labels in Gmail batchModify calls, chunked to Gmail's 1000-ID limit.
- *
- * This safe version catches errors per chunk so one failed chunk does not stop
- * the rest of the run, and retries each failed chunk using exponential backoff.
  *
  * @param {string[]} messageIds Message IDs to modify
  * @param {string[]} addLabelIds Label IDs to add
@@ -633,8 +935,6 @@ function batchModifyMessagesSafe(messageIds, addLabelIds, removeLabelIds) {
 
 /**
  * Retry a single batchModify chunk using exponential backoff.
- *
- * Attempts up to RETRY_MAX_ATTEMPTS times total.
  *
  * @param {string[]} chunk Message IDs for this batch
  * @param {string[]} addLabelIds Label IDs to add
@@ -667,11 +967,9 @@ function retryBatchModifyChunk(chunk, addLabelIds, removeLabelIds, batchNumber) 
       return true;
     } catch (err) {
       lastError = err;
-
-      const isLastAttempt = attempt === RETRY_MAX_ATTEMPTS;
       const message = err && err.message ? err.message : String(err);
 
-      if (isLastAttempt) {
+      if (attempt === RETRY_MAX_ATTEMPTS) {
         logInfo(
           `batchModify failed permanently for batch ${batchNumber} (${chunk.length} message(s)) ` +
           `after ${RETRY_MAX_ATTEMPTS} attempt(s): ${message}`
@@ -680,12 +978,10 @@ function retryBatchModifyChunk(chunk, addLabelIds, removeLabelIds, batchNumber) 
       }
 
       const delayMs = RETRY_INITIAL_DELAY_MS * Math.pow(2, attempt - 1);
-
       logInfo(
         `batchModify failed for batch ${batchNumber} (${chunk.length} message(s)) on attempt ` +
         `${attempt}/${RETRY_MAX_ATTEMPTS}: ${message}. Retrying in ${delayMs} ms.`
       );
-
       Utilities.sleep(delayMs);
     }
   }
@@ -738,8 +1034,6 @@ function clearContinuationState() {
 
 /**
  * Delete any existing continuation triggers for this script.
- *
- * This prevents multiple overlapping time-based triggers from piling up.
  */
 function deleteContinuationTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
@@ -753,9 +1047,6 @@ function deleteContinuationTriggers() {
 
 /**
  * Schedule a time-based continuation trigger.
- *
- * Existing continuation triggers are deleted first so only one continuation
- * trigger remains active at a time.
  */
 function scheduleContinuationTrigger() {
   deleteContinuationTriggers();
@@ -769,85 +1060,43 @@ function scheduleContinuationTrigger() {
 }
 
 /**
- * Build state object pointing to the current label/ancestor pair.
- *
- * Used when a run stops before processing the current pair.
+ * Build state object pointing to the current label/ancestor/page position.
  *
  * @param {string} labelName Current label name
  * @param {string} ancestorName Current ancestor name
  * @param {number} labelIndex Current label index
  * @param {number} ancestorIndex Current ancestor index
+ * @param {string|null} pageToken Gmail page token for continuation
  * @returns {Object} Continuation state
  */
-function buildContinuationState(labelName, ancestorName, labelIndex, ancestorIndex) {
+function buildContinuationState(labelName, ancestorName, labelIndex, ancestorIndex, pageToken) {
   return {
     labelName,
     ancestorName,
     labelIndex,
     ancestorIndex,
+    pageToken: pageToken || null,
     savedAt: new Date().toISOString(),
   };
 }
 
 /**
- * Build continuation state for the next logical position after finishing
- * the current label/ancestor pair.
- *
- * @param {Object[]} eligibleLabels Eligible label objects
- * @param {number} labelIndex Current label index
- * @param {string[]} ancestorNames Ancestors for current label
- * @param {number} ancestorIndex Current ancestor index
- * @returns {Object|null} Continuation state, or null if all work is complete
- */
-function buildNextPositionAfterCurrent(eligibleLabels, labelIndex, ancestorNames, ancestorIndex) {
-  if (ancestorIndex + 1 < ancestorNames.length) {
-    return {
-      labelName: eligibleLabels[labelIndex].name,
-      ancestorName: ancestorNames[ancestorIndex + 1],
-      labelIndex: labelIndex,
-      ancestorIndex: ancestorIndex + 1,
-      savedAt: new Date().toISOString(),
-    };
-  }
-
-  if (labelIndex + 1 < eligibleLabels.length) {
-    const nextLabelName = eligibleLabels[labelIndex + 1].name;
-    const nextAncestors = getAncestorNames(nextLabelName);
-
-    if (nextAncestors.length > 0) {
-      return {
-        labelName: nextLabelName,
-        ancestorName: nextAncestors[0],
-        labelIndex: labelIndex + 1,
-        ancestorIndex: 0,
-        savedAt: new Date().toISOString(),
-      };
-    }
-  }
-
-  return null;
-}
-
-/**
  * Resolve the resume position from saved state.
- *
- * Uses names when possible for resilience across label-order changes, and
- * falls back to numeric indices when needed.
  *
  * @param {Object|null} savedState Previously saved state
  * @param {Object[]} eligibleLabels Sorted eligible labels
- * @returns {{labelIndex:number, ancestorIndex:number}}
+ * @returns {{labelIndex:number, ancestorIndex:number, pageToken:(string|null)}}
  */
 function getStartPosition(savedState, eligibleLabels) {
   if (!savedState) {
-    return { labelIndex: 0, ancestorIndex: 0 };
+    return { labelIndex: 0, ancestorIndex: 0, pageToken: null };
   }
 
   const labelIndexByName = eligibleLabels.findIndex(label => label.name === savedState.labelName);
 
   if (labelIndexByName === -1) {
     logInfo(`Saved resume label "${savedState.labelName}" no longer exists or is no longer eligible. Starting over.`);
-    return { labelIndex: 0, ancestorIndex: 0 };
+    return { labelIndex: 0, ancestorIndex: 0, pageToken: null };
   }
 
   const labelName = eligibleLabels[labelIndexByName].name;
@@ -856,12 +1105,13 @@ function getStartPosition(savedState, eligibleLabels) {
 
   if (ancestorIndexByName === -1) {
     logInfo(`Saved resume ancestor "${savedState.ancestorName}" no longer applies to "${labelName}". Starting label from first ancestor.`);
-    return { labelIndex: labelIndexByName, ancestorIndex: 0 };
+    return { labelIndex: labelIndexByName, ancestorIndex: 0, pageToken: null };
   }
 
   return {
     labelIndex: labelIndexByName,
     ancestorIndex: ancestorIndexByName,
+    pageToken: savedState.pageToken || null,
   };
 }
 
@@ -871,11 +1121,6 @@ function getStartPosition(savedState, eligibleLabels) {
 
 /**
  * Validate a skip list against current Gmail labels.
- *
- * Logs:
- * - number of entries
- * - labels that do not exist
- * - labels that are system labels
  *
  * @param {string} listName Human-readable list name
  * @param {string[]} skipList List values to validate
