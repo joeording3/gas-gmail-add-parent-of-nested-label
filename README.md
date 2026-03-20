@@ -1,130 +1,400 @@
 # gas-gmail-add-parent-of-nested-label
 
-Google Apps Script that adds ancestors' labels to Gmail messages labeled with one of their descendants.
+Google Apps Script that adds ancestor labels to Gmail messages labeled with one of their nested descendants.
 
-The goal of this script is to create a Gmail label search experience more akin to a directory search without having to duplicate and combine filter rules. 
+This version:
 
-Gmail's custom user labels can be nested below one another and Gmail displays labels in the menu in a way that closely mimics a computer's directory structure. Unlike a search on a computer, when searching a label Gmail does not automatically include its descendants. 
+- adds **all ancestor labels**, not just the immediate parent
+- supports **skip lists**
+- supports **optional system-label filtering**
+- processes messages **incrementally page by page**
+- uses **batched label updates**
+- uses **retry with exponential backoff**
+- supports **automatic continuation across runs** for large backlogs
+- stops cleanly when a **message cap** or **time budget** is reached
 
-This script was developed because my preferred default approach to searching within labels is to 'include' rather than 'exclude' their descendants.
+The goal of this script is to create a Gmail label search experience that behaves more like a directory search, without having to duplicate and combine filter rules manually.
 
-## Example  
+Gmail custom user labels can be nested below one another, and Gmail displays labels in a way that resembles a directory tree. But searching a parent label in Gmail does **not** automatically include its descendants.
+
+This script makes descendant-labeled messages also receive their ancestor labels, so searching a parent label behaves more like an inclusive tree search.
+
+## Example
+
 **Ancestor**  
-Label located in the same branch as another but at least one level higher up (e.g. parent, grandparent, etc.)  
-   
-**Descendent**  
-Label located in the same branch as another but at least one level lower down (e.g. child, grandchild, etc.)  
+A label in the same branch that is at least one level higher up, such as a parent or grandparent.
 
-In this menu, the label 'eriador' has 4 descendants:  
+**Descendant**  
+A label in the same branch that is at least one level lower down, such as a child or grandchild.
 
-     ------------
-     Sent
-     All Mail 
-     Spam
-     Drafts
-     eriador
-        > shire
-             > westfarthing
-        > rivendell
-        > breeland
-     ------------   
+In this menu, the label `eriador` has 4 descendants:
 
-  
-**4 Descendants of 'eriador'**  
+```text
+------------
+Sent
+All Mail
+Spam
+Drafts
+eriador
+   > shire
+        > westfarthing
+   > rivendell
+   > breeland
+------------
+```
 
-     3 Children:   'shire' ('eriador-shire'), 'rivendell' ('eriador-rivendell'), and 'breeland' ('eriador-breeland')
-     1 Grandchild: 'westfarthing' ('eriador-shire-westfarthing') 
-     
+**4 descendants of `eriador`**
+
+```text
+3 children:   "shire", "rivendell", and "breeland"
+1 grandchild: "westfarthing"
+```
+
 **Also note**
 
-     'shire' is an ancestor of 'westfarthing'  
-     'westfarthing' is a descendent of both 'shire' and 'eriador'
-     
+```text
+"shire" is an ancestor of "westfarthing"
+"westfarthing" is a descendant of both "shire" and "eriador"
+```
 
-**Search Eriador for Isildur's Bane**  
-  
-To search for "Isildur's Bane" in 'eriador' including its descendants ('shire', 'westfarthing', 'rivendell', and 'breeland') the Gmail search needs to be a variation of:
+### Search Eriador for Isildur's Bane
 
-     Search:  "Isildur's Bane" label:({eriador eriador-shire eriador-shire-westfarthing eriador-rivendell eriador-breeland})
-   
-   
-### One Label to Bind them All  
-Using this script you are able to find Isildur's Bane wherever it is in Eriador using:  
+Without this script:
 
-     Search:  "Isildur's Bane" label:eriador  
+```text
+"Isildur's Bane" label:(eriador OR eriador/shire OR eriador/shire/westfarthing OR eriador/rivendell OR eriador/breeland)
+```
 
-## Installation  
-   
-A.  Create a Google Apps Script (GAS) Project  
-B.  Paste the Code.js file contents into your GAS Project's Code.gs file.  
-C.  Add the dependency 'Advanced Gmail API Service' to your GAS Project.  
-D.  Authorize project to access your Gmail.  
-E.  Create Trigger
-  
-### A. Create Google Apps Script Project
-1. Sign in to your Google Account in Chrome web browser.
-2. Navigate to script.google.com  *If this is the first time you've been to script.google.com, click View Dashboard.*
-3. At the top left, click 'New project'.
-4. Name the project by clicking on 'Untitled project'. 
+With this script:
 
-### B. Paste the Code
-5. Delete any pre-populated code from the script editor (e.g. function myFunction(), etc.)
-6. Using a text editor copy the contents of the Code.gs file and paste it into the script editor.
-7. Click the Save button.
+```text
+"Isildur's Bane" label:eriador
+```
+
+## What this version does
+
+If a message has:
+
+```text
+sport/hockey
+```
+
+the script adds:
+
+```text
+sport
+```
+
+If a message has:
+
+```text
+sport/lax/field
+```
+
+the script adds:
+
+```text
+sport
+sport/lax
+```
+
+It only adds missing ancestor labels. It does not remove any labels.
+
+## Features
+
+### Full ancestor propagation
+
+For nested labels, this version adds **all missing ancestors** in the chain.
+
+Examples:
+
+```text
+sport/hockey      -> sport
+sport/lax/field   -> sport, sport/lax
+```
+
+### Skip lists
+
+You can exclude:
+
+- exact labels from processing
+- all descendants of selected labels
+
+### Optional system-label filtering
+
+You can restrict processing to messages matching Gmail system-label criteria.
+
+Example:
+
+```javascript
+const REQUIRED_SYSTEM_LABELS_ALL = ["UNREAD", "INBOX"];
+const EXCLUDED_SYSTEM_LABELS = ["TRASH", "SPAM"];
+```
+
+### Incremental processing
+
+This version:
+
+- fetches Gmail search results page by page
+- processes each page immediately
+- stops cleanly when the run is near its limits
+- resumes later from the saved position
+
+### Batched updates
+
+Label updates use Gmail API `batchModify`, split into chunks to stay within Gmail's API limits.
+
+### Retry with exponential backoff
+
+Transient failures in both:
+
+- `messages.list`
+- `messages.batchModify`
+
+are retried automatically.
+
+### Trigger-based continuation
+
+If a run cannot finish within one Apps Script execution, the script saves its place and schedules a continuation trigger automatically.
+
+## How continuation works
+
+This version keeps track of:
+
+- current label
+- current ancestor
+- current Gmail `pageToken`
+
+If a run stops because it reaches either:
+
+- the configured message cap, or
+- the configured time budget
+
+it saves state and schedules another run.
+
+The next run resumes from the same point, including mid-query when needed.
+
+## Installation
+
+A. Create a Google Apps Script project  
+B. Paste the script into `Code.gs`  
+C. Add the Advanced Gmail API service  
+D. Authorize the project  
+E. Create an initial trigger
+
+### A. Create Google Apps Script project
+
+1. Sign in to your Google account.
+2. Go to `script.google.com`.
+3. Click **New project**.
+4. Give the project a name.
+
+### B. Paste the code
+
+5. Delete any pre-populated code in the editor.
+6. Paste the script into `Code.gs`.
+7. Save the project.
 
 ### C. Add dependency
-8. Click on the plus (+) symbol on 'Services  +' to open the 'Add a service' dialog.
-9. Type 'Gmail' in the 'Identifier' field.
-10. Click 'Add'
 
-### D. Authorize Project
-11. Open Code.gs in the script editor
-12. Make sure 'addParentLabel' is the function selected to the right of 'Run' and 'Debug'
-13. Click on the 'Run' button beside 'Debug' at the top of the page.
-14. Click on 'Review permissions' in the 'Authorization required' dialog that appears.
-15. Choose the Google account you'd like to allow the script to access.
-16. You will see a warning that 'Google hasn’t verified this app' because... Google hasn't verified this App :-)
-17. Click on the 'Advanced' link
-18. Click on the 'Go to [custom script name here] (unsafe)' link.
-19. Read the warning about the fact that this script wants to access your Gmail account.    
-20. Click 'Allow' if you'd like to allow this script access.
+8. In the Apps Script editor, click **Services**.
+9. Add the **Gmail API** advanced service.
 
-**Please Note**:
+### D. Authorize project
 
-     If you completed steps 11 - 20, but took too long, that script instance will have timed
-     out with a permission-related error.  Don't worry, future instances will succeed.  Simply
-     manually run the script again to confirm by repeating steps 12 - 14.  You should no longer
-     be prompted for authorization.
+10. In the editor, select the `addParentLabel` function.
+11. Click **Run**.
+12. Review and grant permissions.
 
-### E. Create Trigger
-21. Click on the 'Trigger' menu button (alarm clock image) in the left menu.
-22. Click the '+  Add Trigger' button at the bottom right of the Triggers page.
-23. Configure Trigger:  
+### E. Create trigger
 
-**Trigger Settings**:  
+#### Option 1: Manual start only
 
-     Choose which function to run:       addParentLabel  
-     Choose which deployment should run: Head  
-     Select event source:                Time-driven  
+Run `addParentLabel()` manually whenever you want to start a full pass.  
+If the mailbox is large, the script will schedule continuation triggers automatically as needed.
 
-**Set the following to your preference.  Here are my settings**:  
-    
-     Select type of time based trigger:  Minutes timer  
-     Select minute interval:             Every 5 minutes   
-     Failure notification settings:      Notify me immediately   
+#### Option 2: Recurring scheduled runs
 
+Create a time-driven trigger for `addParentLabel`.
 
-## Custom Settings  
+Suggested settings:
+
+```text
+Choose which function to run:       addParentLabel
+Choose which deployment should run: Head
+Select event source:                Time-driven
+```
+
+## Configuration
+
+Edit the constants near the top of the script.
+
+### Skip lists
+
+#### Exclude descendants of these labels
+
+```javascript
+const OFFSPRING_SKIP_LIST = [
+  // "auctions",
+];
+```
+
+#### Exclude these exact labels
+
+```javascript
+const LABEL_SKIP_LIST = [
+  // "shopping/amazon",
+];
+```
+
+### System-label filters
+
+#### Any of these must match
+
+```javascript
+const REQUIRED_SYSTEM_LABELS_ANY = [
+  // "UNREAD",
+];
+```
+
+#### All of these must match
+
+```javascript
+const REQUIRED_SYSTEM_LABELS_ALL = [
+  // "INBOX",
+];
+```
+
+#### None of these may match
+
+```javascript
+const EXCLUDED_SYSTEM_LABELS = [
+  "TRASH",
+  "SPAM",
+];
+```
+
+Examples:
+
+Only unread inbox messages:
+
+```javascript
+const REQUIRED_SYSTEM_LABELS_ANY = [];
+const REQUIRED_SYSTEM_LABELS_ALL = ["UNREAD", "INBOX"];
+const EXCLUDED_SYSTEM_LABELS = ["TRASH", "SPAM"];
+```
+
+Only unread or starred messages:
+
+```javascript
+const REQUIRED_SYSTEM_LABELS_ANY = ["UNREAD", "STARRED"];
+const REQUIRED_SYSTEM_LABELS_ALL = [];
+const EXCLUDED_SYSTEM_LABELS = ["TRASH", "SPAM"];
+```
+
+Process everything except trash and spam:
+
+```javascript
+const REQUIRED_SYSTEM_LABELS_ANY = [];
+const REQUIRED_SYSTEM_LABELS_ALL = [];
+const EXCLUDED_SYSTEM_LABELS = ["TRASH", "SPAM"];
+```
+
 ### Logging
-There are 3 log levels depending on the amount of detail you want to display:
-Level 1 = info (default)
-Level 2 = verbose 
-Level 3 = debug
 
-You can change the level by editing the number in Code.gs
+```text
+1 = info
+2 = verbose
+3 = debug
+```
+
+```javascript
+const LOG_LEVEL = 1;
+```
+
+### Dry run
+
+```javascript
+const DRY_RUN = true;
+```
+
+### Processing limits
+
+```javascript
+const MAX_MESSAGES_PER_RUN = 2000;
+const MAX_RUNTIME_MS = 4.5 * 60 * 1000;
+```
+
+### Gmail API page and batch sizes
+
+```javascript
+const SEARCH_PAGE_SIZE = 500;
+const BATCH_MODIFY_SIZE = 1000;
+```
+
+### Retry settings
+
+```javascript
+const RETRY_MAX_ATTEMPTS = 3;
+const RETRY_INITIAL_DELAY_MS = 500;
+```
+
+### Continuation delay
+
+```javascript
+const CONTINUATION_DELAY_MS = 60 * 1000;
+```
+
+## Operational notes
+
+### Large mailboxes
+
+If you have many nested labels and many matching messages, the script may take multiple runs to complete one full pass.
+
+### Repeated runs are safe
+
+The script only targets messages that match:
+
+- the child label
+- not the ancestor label yet
+
+Once an ancestor label has been added, that message no longer matches that query.
+
+### Page-token continuation
+
+This version resumes mid-query using Gmail `pageToken`. If Gmail's result set changes between runs, the exact paging sequence may shift, but the script remains safe because already-updated messages drop out of the `-label:"ancestor"` query.
+
+## Recommended usage
+
+1. Set `DRY_RUN = false`
+2. Leave `MAX_MESSAGES_PER_RUN` modest, such as `1000` or `2000`
+3. Run `addParentLabel()`
+4. Let continuation triggers finish the backlog
+
+After the backlog is cleared, a periodic trigger can keep labels synchronized incrementally.
+
+## Troubleshooting
+
+### "Exceeded maximum execution time"
+
+Lower:
+
+- `MAX_MESSAGES_PER_RUN`
+
+and keep continuation enabled.
+
+### "Empty response" or transient Gmail API failures
+
+The script retries `messages.list` and `batchModify` automatically with exponential backoff.
+
+### Missing ancestor label
+
+If a nested label exists but one of its ancestor labels does not actually exist as a Gmail label, that ancestor is skipped and logged.
+
+### Too many messages for one run
+
+The script will stop early, save state, and schedule continuation.
 
 ## Feedback
-This was my first Google Apps Script as well as my first Git.  This may be reflected in poor and/or odd choices in both spaces. Constructive feedback is welcomed and, of course, please advise of any issues/bugs encountered.  
 
-
-
+Constructive feedback and bug reports are welcome.
