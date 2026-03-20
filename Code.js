@@ -1,344 +1,997 @@
 /**
- * 
- *   +----------------------------------------+
- *   |  GAS Gmail Add Parent of Nested Label  |
- *   +----------------------------------------+ 
- *   
- *   rev. 2023-06-27
- *   rev. 2021-11-17
- *   
- *   https://github.com/CaTeNdrE/gas-gmail-add-parent-of-nested-label
- *   
- *  
- *   Google Action Script (GAS) that searches Gmail messages in nested
- *   user labels and applies their parent label if it is missing.
- * 
- *   Ensures that a Gmail labeled with:
- *     
- *   "sport/hockey"     is also in "sport"
- *   "sport/basketball" is also in "sport"
- *   "sport/lax/field"  is also in "sport" as well as "sport/lax"
- * 
- *   Skip Lists are used to exclude labels from this behavior.  
- *   A label can be excluded by both lists without causing any issues.
+ * Gmail Add Parent Labels for Nested Labels
+ * ----------------------------------------
+ *
+ * Purpose
+ * -------
+ * For Gmail messages that have nested user labels, ensure that all ancestor
+ * labels are also applied.
+ *
+ * Examples
+ * --------
+ *   "sport/hockey"      -> also add "sport"
+ *   "sport/basketball"  -> also add "sport"
+ *   "sport/lax/field"   -> also add "sport" and "sport/lax"
+ *
+ * Features
+ * --------
+ * - Skips labels listed in LABEL_SKIP_LIST
+ * - Skips descendants of labels listed in OFFSPRING_SKIP_LIST
+ * - Optional filtering based on Gmail system labels/search operators
+ * - Uses batchModify for performance
+ * - Chunks batchModify to Gmail API's 1000-ID limit
+ * - Retries failed batchModify chunks with exponential backoff
+ * - Catches per-batch errors so one failed chunk does not stop the whole run
+ * - Stops after MAX_MESSAGES_PER_RUN to reduce Apps Script timeout risk
+ * - Automatically schedules continuation runs for large backlogs
+ *
+ * Requirements
+ * ------------
+ * 1. Enable the Advanced Gmail service in Apps Script:
+ *      Services -> Gmail API -> On
+ * 2. Also ensure the Gmail API is enabled in the linked Google Cloud project.
+ *
+ * Notes
+ * -----
+ * - Only user labels are processed as source labels.
+ * - System labels are ignored as source labels.
+ * - The script adds missing ancestor labels but never removes labels.
+ * - Continuation resumes at the next label/ancestor pair, not mid-query page.
  */
 
-//    Offsprint Skip List
-//  +-----------------------------------------------------------------
-//  | Array of labels whose offspring (children, grandchildren, etc.) 
-//  | will be excluded from syncing. To also exclude the actual labels 
-//  | in this list, they must also be added to the "Labels Skip List". 
-//  +----------------------------------------------------------------- 
-      const offspring = [
- //       "Sync Issues",
- //       "mymessages",
- //       "theOffspring",    // eg. Non-existent Ancestor  
- //       "INBOX"            // eg. System Label
-      ];
-
-//    Labels Skip List
-//  +------------------------------------------------------ 
-//  | Array of individual labels to exclude from syncing to 
-//  | their parents, grandparents, great-grandparents, etc.
-//  +------------------------------------------------------
-      const skiplabel = [
-//        "SENT",               // eg. System Label
-//        "noLabelsPlease",     // eg. Non-existent label       
-//        "notReal/andWrong"    // eg. Non-existent label
-      ];
-
-//    Log Level (loglevel) 
-//  +--------------------------------------------- 
-//  | 1 = info [default], 2 = verbose,  3 - debug)
-//  +---------------------------------------------  
-      const loglevel = 1; 
-
+/* ========================================================================== */
+/* Configuration                                                               */
+/* ========================================================================== */
 
 /**
- *    +---------------------------------+
- *    |                                 | 
- *    |  Be careful editing below here  |
- *    |                                 | 
- *    +---------------------------------+ 
+ * Labels whose descendants should be excluded from syncing.
+ *
+ * Example:
+ *   If "auctions" is in this list, then:
+ *     "auctions/ebay"
+ *   is excluded.
+ *
+ * Note:
+ * - The label itself is NOT excluded unless it is also listed in LABEL_SKIP_LIST.
  */
+const OFFSPRING_SKIP_LIST = [
+//  "auctions",
+];
 
-const logs = {};
-const pad = {};
-const list = {};
-const len = {};
-// const namesList = [];
-const names = { All: [], System: [], List: []  };
-const sp = String.fromCharCode(160); // define a non-breaking space for use as needed.
-const padDef = 3;          // default number padding
-const skiplog = { 
-  Name: [], Type: [], Output: [], Count: 0
-};
-
-/** 
- *    +------------------+
- *    |  addParentLabel  |
- *    +------------------+
+/**
+ * Individual labels to exclude directly.
+ *
+ * Example:
+ *   If "shopping/amazon" is in this list, that exact label is skipped.
  */
+const LABEL_SKIP_LIST = [
+//  "shopping/amazon",
+];
 
+/**
+ * Optional Gmail search filters using system labels / operators.
+ *
+ * These are appended to every Gmail search query used to find messages
+ * that need ancestor labels added.
+ *
+ * Notes:
+ * - These values should use valid Gmail search syntax labels/operators.
+ * - Examples:
+ *     "UNREAD"
+ *     "STARRED"
+ *     "IMPORTANT"
+ *     "INBOX"
+ *     "SENT"
+ *     "DRAFT"
+ *     "SPAM"
+ *     "TRASH"
+ *     "CATEGORY_PERSONAL"
+ *     "CATEGORY_SOCIAL"
+ *     "CATEGORY_PROMOTIONS"
+ *     "CATEGORY_UPDATES"
+ *     "CATEGORY_FORUMS"
+ *
+ * Behavior:
+ * - REQUIRED_SYSTEM_LABELS_ANY:
+ *     At least one must match. Combined as: (label:X OR label:Y ...)
+ * - REQUIRED_SYSTEM_LABELS_ALL:
+ *     All must match. Combined as: label:X label:Y ...
+ * - EXCLUDED_SYSTEM_LABELS:
+ *     None may match. Combined as: -label:X -label:Y ...
+ *
+ * Example:
+ *   Only unread inbox mail:
+ *     REQUIRED_SYSTEM_LABELS_ALL = ["UNREAD", "INBOX"]
+ *
+ *   Only unread or starred mail:
+ *     REQUIRED_SYSTEM_LABELS_ANY = ["UNREAD", "STARRED"]
+ *
+ *   Skip trash and spam:
+ *     EXCLUDED_SYSTEM_LABELS = ["TRASH", "SPAM"]
+ */
+const REQUIRED_SYSTEM_LABELS_ANY = [
+  // "UNREAD",
+];
+
+const REQUIRED_SYSTEM_LABELS_ALL = [
+  // "INBOX",
+];
+
+const EXCLUDED_SYSTEM_LABELS = [
+  "TRASH",
+  "SPAM",
+];
+
+/**
+ * Logging verbosity.
+ * 1 = info
+ * 2 = verbose
+ * 3 = debug
+ */
+const LOG_LEVEL = 1;
+
+/**
+ * When true, the script logs intended work but does not modify Gmail.
+ */
+const DRY_RUN = false;
+
+/**
+ * Maximum number of messages returned per Gmail.Users.Messages.list call.
+ *
+ * Gmail currently allows up to 500 here.
+ */
+const SEARCH_PAGE_SIZE = 500;
+
+/**
+ * Maximum number of message IDs allowed per Gmail.Users.Messages.batchModify call.
+ *
+ * Gmail currently limits this to 1000.
+ */
+const BATCH_MODIFY_SIZE = 1000;
+
+/**
+ * Safety cap for one execution.
+ *
+ * Once this many messages have been scheduled for update in a run, the script
+ * stops and schedules a continuation trigger so the next execution can continue.
+ */
+const MAX_MESSAGES_PER_RUN = 10000;
+
+/**
+ * Delay before continuation trigger fires, in milliseconds.
+ */
+const CONTINUATION_DELAY_MS = 60 * 1000;
+
+/**
+ * Retry configuration for failed batchModify chunks.
+ *
+ * The script retries transient failures with exponential backoff:
+ *   delay = RETRY_INITIAL_DELAY_MS * 2^(attempt - 1)
+ *
+ * Example with defaults:
+ *   attempt 1 retry -> 1 second
+ *   attempt 2 retry -> 2 seconds
+ *   attempt 3 retry -> 4 seconds
+ */
+const RETRY_MAX_ATTEMPTS = 4;
+const RETRY_INITIAL_DELAY_MS = 1000;
+
+/**
+ * Prefix used for state stored in Script Properties.
+ */
+const STATE_KEY = "GMAIL_PARENT_LABEL_SYNC_STATE";
+
+/**
+ * Name of the triggerable entrypoint used for continuation.
+ */
+const CONTINUATION_FUNCTION_NAME = "resumeAddParentLabel";
+
+/* ========================================================================== */
+/* Entry points                                                                */
+/* ========================================================================== */
+
+/**
+ * Main entrypoint.
+ *
+ * Starts a fresh run from the beginning of the eligible label list.
+ * Clears any previous continuation state before starting.
+ */
 function addParentLabel() {
+  clearContinuationState();
+  runAddParentLabel({ resume: false });
+}
 
-  if (!([1, 2, 3].indexOf(loglevel) > -1)) {
-    loglevel = 1;
+/**
+ * Continuation entrypoint.
+ *
+ * Called by a time-based trigger when a prior run hit the per-run cap and
+ * scheduled a continuation.
+ */
+function resumeAddParentLabel() {
+  runAddParentLabel({ resume: true });
+}
+
+/* ========================================================================== */
+/* Main workflow                                                               */
+/* ========================================================================== */
+
+/**
+ * Core runner for both fresh and resumed executions.
+ *
+ * Workflow:
+ * 1. Load Gmail labels
+ * 2. Validate skip lists
+ * 3. Validate system-label filters
+ * 4. Build eligible nested user labels
+ * 5. Walk each label and each ancestor
+ * 6. Find messages that have child label but not ancestor label
+ * 7. Optionally restrict by system-label filters
+ * 8. Add missing ancestor label in batches of up to 1000
+ * 9. Stop early if MAX_MESSAGES_PER_RUN is reached
+ * 10. Save continuation state and schedule next trigger if needed
+ *
+ * @param {Object} options
+ * @param {boolean} options.resume Whether this run is resuming from saved state
+ */
+function runAddParentLabel(options) {
+  const logLevel = normalizeLogLevel(LOG_LEVEL);
+  const resume = Boolean(options && options.resume);
+
+  const gmailLabels = Gmail.Users.Labels.list("me").labels || [];
+  const userLabels = gmailLabels.filter(label => label.type === "user");
+  const systemLabels = gmailLabels.filter(label => label.type === "system");
+
+  const allLabelNames = gmailLabels.map(label => label.name);
+  const allLabelNameSet = new Set(allLabelNames);
+  const systemLabelNameSet = new Set(systemLabels.map(label => label.name));
+  const labelMap = new Map(gmailLabels.map(label => [label.name, label]));
+  const skippedLabels = new Set(LABEL_SKIP_LIST);
+
+  logInfo(`Retrieved ${gmailLabels.length} Gmail labels.`);
+  logInfo(`${systemLabels.length} system labels ignored as source labels.`);
+  logInfo(`${userLabels.filter(label => !label.name.includes("/")).length} user labels have no parent.`);
+
+  validateSkipList("Offspring", OFFSPRING_SKIP_LIST, allLabelNameSet, systemLabelNameSet);
+  validateSkipList("Labels", LABEL_SKIP_LIST, allLabelNameSet, systemLabelNameSet);
+  validateSystemLabelFilters(systemLabelNameSet);
+
+  const systemFilterQuery = buildSystemLabelFilterQuery();
+  if (systemFilterQuery) {
+    logInfo(`System-label filter active: ${systemFilterQuery}`);
   }
 
-  mylabels = Gmail.Users.Labels.list('me').labels;
-  mylabels.forEach(thisLabel => names.All.push(thisLabel.name));
+  const nestedUserLabels = userLabels.filter(label => label.name.includes("/"));
+  const skipMatches = [];
+  const eligibleLabels = [];
 
-  let labelcount = names.All.length.toString();
-  let padnum = labelcount.length;
-  
-  let fetchlog = labelcount.padStart(padnum) + " GMAIL labels retrieved";
-  let uline = '\n' + "-".padEnd(fetchlog.length, "-");
-  fetchlog +=  uline;
-
-  if (loglevel > 2) {
-    let line = 0;
-    mylabels.forEach(thisLabel => console.log((++line).toString().padStart(padDef)
-      + sp + thisLabel));
+  for (const label of nestedUserLabels) {
+    const reason = getSkipReason(label.name, skippedLabels, OFFSPRING_SKIP_LIST);
+    if (reason) {
+      skipMatches.push({ label: label.name, reason });
+    } else {
+      eligibleLabels.push(label);
+    }
   }
-  
-  //  System labels
-  list.System = mylabels.filter(thisLabel => thisLabel.type == "system");
-  list.System.forEach(thisLabel => names.System.push(thisLabel.name));
-  
-  fetchlog += '\n' + list.System.length.toString().padStart(padnum) + " are system labels";
 
-  //  User labels with no parent
-  len.orphan = (list.orphan = mylabels.filter(
-    thisLabel => (!(thisLabel.name.search("/") > 0) && thisLabel.type == "user")
-    )).length.toString();    
+  eligibleLabels.sort((a, b) => a.name.localeCompare(b.name));
 
-  fetchlog += '\n' + len.orphan.padStart(padnum) + " have no parent";
+  if (skipMatches.length > 0) {
+    logInfo(`${skipMatches.length} nested user labels match skip lists.`);
+    if (logLevel >= 2) {
+      logVerbose(formatSkipMatches(skipMatches));
+    }
+  }
 
-  //  In a skip list and match a valid label 
-  const relevant = mylabels.filter(
-    thisLabel => thisLabel.name.search("/") > 0
-      && thisLabel.type == "user"
-      && matchLabel(thisLabel.name, skiplabel, offspring, padDef) > 0
-  );    
+  logInfo(`${eligibleLabels.length} user labels to search.`);
 
-  if (relevant.length) {
-    fetchlog += '\n' + relevant.length.toString().padStart(padnum)
-    + " match skip lists"
-  };
+  if (logLevel >= 2) {
+    const names = eligibleLabels.map(label => label.name);
+    logVerbose("Checking labels:\n" + names.map(name => `  - ${name}`).join("\n"));
+  }
 
-  //  User label has parent and not excluded by a skip list  
-  const valid = mylabels.filter(
-    thisLabel => thisLabel.type == "user" 
-      && thisLabel.name.search("/") > 0 
-      && matchLabel(thisLabel.name, skiplabel, offspring, padDef, 1) == 0
+  const savedState = resume ? loadContinuationState() : null;
+  const startPosition = getStartPosition(savedState, eligibleLabels);
+
+  if (resume) {
+    if (savedState) {
+      logInfo(
+        `Resuming from label index ${startPosition.labelIndex + 1}, ancestor index ${startPosition.ancestorIndex + 1}.`
       );
-  len.Valid = valid.length.toString();
-  
-
-  fetchlog += uline + '\n' + len.Valid.padStart(padnum)
-    + " user labels to search";
- 
-  Logger.log(fetchlog);
-
-  if (skiplog.Name.length) { thisPad = getPadding(skiplog.Name, 3)};  
-    
-  
-  
-  // validate skip lists 
-  if (offspring.length) validate(offspring, "Offspring", padnum);  
-  if (skiplabel.length) validate(skiplabel, "Labels", padnum);
-
-  // List  matching user labels if loglevel > 1 
-  if (loglevel > 1) {
-
-    for (let i = 0; i < skiplog.Name.length; i++) {
-    skiplog.Output += (skiplog.Name[i].padEnd(thisPad, sp) + skiplog.Type[i] + '\n'); 
-  };
-
-    let txt = "Gmail User Labels that matched a Skip List";
-    Logger.log(txt + '\n' + "-".padEnd(txt.length, "-") + '\n' + skiplog.Output);
-  };
-   
-  valid.forEach(thisLabel => names.List.push(thisLabel.name));
-  names.List.sort();
-  let padname = getPadding(names.List, 1);    // length of longest string plus x sps (or 1 if omitted);
-  checking = "Checking messages in " + len.Valid + " labels"; 
-  Logger.log(checking + (loglevel > 1 ? logLabels(names.List, checking.length, padname) : ""));
-
-/**
- *    +-----------------+
- *    |  Search Emails  |
- *    +-----------------+
- */
-
-  for (let i = 0; i < len.Valid; i++) {
-    
-    let label = valid[i].name;
-
-    // Parent label's Gmail ID (retrieve using index from name)
-    let thisParent = label.replace("/" + label.split("/").pop(), "");
-    let thisParentIndex = mylabels.findIndex(thisIndex => thisIndex.name == thisParent); 
-    let thisParentId = mylabels[thisParentIndex].id;
-
-    
-    let thisQuery = "\-label:" + thisParent + " label:" + label; // this label but not its parent
-
-    let msgList = Gmail.Users.Messages.list("me", { "q": thisQuery }).messages;  // list of matching messages
-  
-    if (msgList) {
-      var allUpdates = +1;
-      let thisLog = "";
-    
-      for (let j = 0; j < msgList.length; j++) {  // for each msg in list
-        let msgNum = +j + 1;
-        let msgId = msgList[j].id;
-        let addLabel = thisParentId;
-        thisLog += msgNum.toString().padStart(padDef, sp) + sp + "\"" + thisParent + "\"" + sp + "added" + sp + "to" + sp + "msgID" + sp + msgId.padEnd(17, sp) + " ";
-      
-        Gmail.Users.Messages.modify(
-          {
-            'addLabelIds': [addLabel]
-          },
-            'me', msgId
-        );
-      };
-
-      let thisLogPad = + padDef + 40 + (msgList.length > 1 ? 2 : 0) + label.length + thisParent.length;
-      Logger.log(msgList.length.toString().padStart(padDef, sp) + sp + (msgList.length > 1 ? "messages" : "message") + sp + "with \"" + label + "\"" + sp + (msgList.length > 1 ? "were" : "was") + sp + "missing the label \"" + thisParent + "\"" + (loglevel > 1 ? '\n' + "--".padEnd(thisLogPad, "-") + '\n' + thisLog : ""));
-    
-    }; 
-
-  };
-
-  if (!allUpdates) Logger.log("All labelled messages included the labels of their ancestors");  
-
-}
-
-
-
-/**
- *    +--------------+
- *    |  Log Labels  |
- *    +--------------+
- */
-
-function logLabels(arr, num, pad) {
-  let log = '\n' + ("-").padEnd(num, "-") + '\n';
-  for (let i = 0; i < arr.length; i++) {
-    let label = (i + 1).toString().padStart(padDef, sp) + sp + 
-    arr[i].replaceAll(' ', sp).padEnd(pad);
-    log += label;
+    } else {
+      logInfo("No saved continuation state found. Starting from the beginning.");
+    }
   }
-  return log;
-}
 
+  let labelsChecked = 0;
+  let updateGroups = 0;
+  let totalMessagesTouched = 0;
+  let totalBatchCalls = 0;
+  let totalBatchFailures = 0;
+  let hitRunCap = false;
+  let nextState = null;
 
-/**
- *    +-----------------------+
- *    |  Skip List Validation |
- *    +-----------------------+
- */
+  for (let labelIndex = startPosition.labelIndex; labelIndex < eligibleLabels.length; labelIndex++) {
+    const label = eligibleLabels[labelIndex];
+    labelsChecked += 1;
 
-function validate(list, name, pad) {
-  
-  let len = list.length;
-  let log = len.toString().padStart(pad) + (len == 1 ? " entry" : " entries")  + " in " + name + " skip list"
-
-  let nomatch = list.filter(thisLabel => names.All.indexOf(thisLabel) == -1);
-  let system = list.filter(thisLabel => names.System.includes(thisLabel));
-  let nl = nomatch.length, sl = system.length;
-
-  (nl || sl) && (log += '\n' + "-".padEnd(log.length, "-")); 
-    
-  if (nl) {
-
-    log +=  '\n' + nl.toString().padStart(pad) + (nl > 1 ? " don't" : " doesn't") + " exist:";
-
-    for (let i = 0; i < nl; i++) {
-      
-      ([i] < 1) && (log += ("[").padStart(pad, sp));
-      log += sp + nomatch[i];
-      (([i] == (nl - 1)) && (log += " ]")) || (log += ","); 
-
-    };
-
-  };
-
-  if (sl) {
-
-    log +=  '\n' + sl.toString().padStart(pad) + (sl > 1 ? " are system labels" : " is a system label") + " and ignored:";
-
-    for (let i = 0; i < sl; i++) {
-      
-      ([i] < 1) && (log += ("[").padStart(pad, sp));
-      log += sp + system[i];
-      (([i] == (sl - 1)) && (log += " ]")) || (log += ","); 
-
-    };
-
-  };
-
-  Logger.log(log);
-
-}
-
-
-/**
- *    +-----------------------+
- *    |  matchLabel Function  |
- *    +-----------------------+
- */
-
-function matchLabel(strVal, arrVal, arrDes, padDef, log, pad) {
-
-  for (let i = 0; i < arrDes.length; i++) {
-
-    if (strVal.startsWith(arrDes[i] + "/")) {
-
-      if (log == 1) {
-        skiplog.Count += 1;
-        skiplog.Name.push(skiplog.Count.toString().padStart(padDef) + sp + strVal);
-        skiplog.Type.push(("Ancestor:" + sp + arrDes[i]).replaceAll(' ', sp));
-      }
-      return 1;
+    const ancestorNames = getAncestorNames(label.name);
+    if (ancestorNames.length === 0) {
+      continue;
     }
 
-    for (let i = 0; i < arrVal.length; i++) {
-      if (strVal == arrVal[i]) {
-        if (log == 1) {
-          skiplog.Count += 1;
-          skiplog.Name.push(skiplog.Count.toString().padStart(padDef) + sp + strVal.replaceAll(' ', sp));
-          skiplog.Type.push("Labels Skip List".replaceAll(' ', sp));
+    if (logLevel >= 3) {
+      logDebug(`Checking "${label.name}" with ancestors: ${ancestorNames.join(", ")}`);
+    }
+
+    const ancestorStartIndex =
+      labelIndex === startPosition.labelIndex ? startPosition.ancestorIndex : 0;
+
+    for (let ancestorIndex = ancestorStartIndex; ancestorIndex < ancestorNames.length; ancestorIndex++) {
+      const ancestorName = ancestorNames[ancestorIndex];
+      const ancestorLabel = labelMap.get(ancestorName);
+
+      if (!ancestorLabel) {
+        logInfo(`Skipping "${label.name}" -> missing ancestor label "${ancestorName}".`);
+        continue;
+      }
+
+      const query = buildMessageSearchQuery(label.name, ancestorName, systemFilterQuery);
+      const messageIds = listAllMessageIds(query);
+
+      if (messageIds.length === 0) {
+        if (logLevel >= 3) {
+          logDebug(`No messages missing "${ancestorName}" for "${label.name}".`);
         }
-        return 1;
+        continue;
+      }
+
+      if (
+        totalMessagesTouched > 0 &&
+        totalMessagesTouched + messageIds.length > MAX_MESSAGES_PER_RUN
+      ) {
+        hitRunCap = true;
+        nextState = buildContinuationState(label.name, ancestorName, labelIndex, ancestorIndex);
+        logInfo(
+          `Per-run cap reached before processing "${label.name}" -> "${ancestorName}". Scheduling continuation.`
+        );
+        break;
+      }
+
+      if (DRY_RUN) {
+        logInfo(`[DRY RUN] Would add "${ancestorName}" to ${messageIds.length} message(s) labeled "${label.name}".`);
+        totalMessagesTouched += messageIds.length;
+        updateGroups += 1;
+      } else {
+        const result = batchModifyMessagesSafe(messageIds, [ancestorLabel.id], []);
+        totalBatchCalls += result.batchCount;
+        totalBatchFailures += result.failureCount;
+        totalMessagesTouched += messageIds.length;
+        updateGroups += 1;
+
+        logInfo(
+          `Added "${ancestorName}" to ${messageIds.length} message(s) labeled "${label.name}" ` +
+          `in ${result.batchCount} batch(es)` +
+          `${result.failureCount > 0 ? ` with ${result.failureCount} failed batch(es)` : ""}.`
+        );
+      }
+
+      if (logLevel >= 2) {
+        logVerbose(buildMessagePreview(label.name, ancestorName, messageIds));
+      }
+
+      if (totalMessagesTouched >= MAX_MESSAGES_PER_RUN) {
+        hitRunCap = true;
+        nextState = buildNextPositionAfterCurrent(eligibleLabels, labelIndex, ancestorNames, ancestorIndex);
+        logInfo("Per-run cap reached. Scheduling continuation.");
+        break;
       }
     }
+
+    if (hitRunCap) {
+      break;
+    }
   }
-  return 0;
+
+  if (hitRunCap && nextState) {
+    saveContinuationState(nextState);
+    scheduleContinuationTrigger();
+  } else {
+    clearContinuationState();
+    deleteContinuationTriggers();
+  }
+
+  if (totalMessagesTouched === 0 && !hitRunCap) {
+    logInfo("All labeled messages already included the labels of their ancestors.");
+    return;
+  }
+
+  logInfo(
+    `${DRY_RUN ? "[DRY RUN] " : ""}Done. Checked ${labelsChecked} label(s), ` +
+    `performed ${updateGroups} update group(s), touched ${totalMessagesTouched} message(s)` +
+    `${DRY_RUN ? "." : `, across ${totalBatchCalls} batchModify call(s), with ${totalBatchFailures} failed batch(es).`}`
+  );
+}
+
+/* ========================================================================== */
+/* Query building                                                              */
+/* ========================================================================== */
+
+/**
+ * Build the Gmail query used to find messages that:
+ * - have the nested child label
+ * - do not yet have the ancestor label
+ * - optionally match configured system-label filters
+ *
+ * @param {string} childLabelName Nested child label
+ * @param {string} ancestorLabelName Missing ancestor label
+ * @param {string} systemFilterQuery Prebuilt optional system-filter clause
+ * @returns {string} Gmail search query
+ */
+function buildMessageSearchQuery(childLabelName, ancestorLabelName, systemFilterQuery) {
+  const parts = [
+    `label:"${childLabelName}"`,
+    `-label:"${ancestorLabelName}"`,
+  ];
+
+  if (systemFilterQuery) {
+    parts.push(systemFilterQuery);
+  }
+
+  return parts.join(" ");
 }
 
 /**
- *    +--------------------+
- *    |  Padding Function  |
- *    +--------------------+
+ * Build the optional Gmail search clause for configured system-label filters.
+ *
+ * Examples of output:
+ *   label:"UNREAD" label:"INBOX" -label:"TRASH" -label:"SPAM"
+ *   {label:"UNREAD" label:"STARRED"} -label:"TRASH"
+ *
+ * @returns {string} Gmail search fragment, or empty string if no filters
  */
+function buildSystemLabelFilterQuery() {
+  const parts = [];
 
-// returns length of longest string in array for column padding 
-function getPadding(list, extra) {     
-  if (!extra) extra = 1;         // define 'extra' spaces if not set
-  if (!Array.isArray(list)) {    // if string, convert to array
-    var oldList = list;
-    var newValue = "x";
-    var list = [list, newValue];
-    Logger.log("**  Type Error: \"" + oldList + "\" was a String. Now converted to Array \"" + list + "\"");
+  if (REQUIRED_SYSTEM_LABELS_ALL.length > 0) {
+    for (const label of REQUIRED_SYSTEM_LABELS_ALL) {
+      parts.push(`label:"${label}"`);
+    }
   }
 
-  if (list.length) {
-      var longest = list.reduce(function (a, b) // determine longest string in the array
-        { return a.length > b.length ? a : b; });
-  };
+  if (REQUIRED_SYSTEM_LABELS_ANY.length > 0) {
+    const anyGroup = REQUIRED_SYSTEM_LABELS_ANY
+      .map(label => `label:"${label}"`)
+      .join(" OR ");
 
-  var padding = longest.length + extra; // set padding as longest string plus 'extra' spaces
-  return padding;
+    parts.push(`{${anyGroup}}`);
+  }
+
+  if (EXCLUDED_SYSTEM_LABELS.length > 0) {
+    for (const label of EXCLUDED_SYSTEM_LABELS) {
+      parts.push(`-label:"${label}"`);
+    }
+  }
+
+  return parts.join(" ").trim();
+}
+
+/**
+ * Validate configured system-label filters against the system labels returned
+ * by the Gmail Labels API.
+ *
+ * This is helpful for catching typos, though some Gmail search operators may
+ * still be valid even if they do not appear in label listings exactly as typed.
+ *
+ * @param {Set<string>} systemLabelNameSet Known system labels from Gmail
+ */
+function validateSystemLabelFilters(systemLabelNameSet) {
+  const allConfigured = [
+    ...REQUIRED_SYSTEM_LABELS_ANY,
+    ...REQUIRED_SYSTEM_LABELS_ALL,
+    ...EXCLUDED_SYSTEM_LABELS,
+  ];
+
+  if (allConfigured.length === 0) {
+    return;
+  }
+
+  const uniqueConfigured = [...new Set(allConfigured)];
+  const missing = uniqueConfigured.filter(name => !systemLabelNameSet.has(name));
+
+  if (missing.length > 0) {
+    logInfo(
+      `Warning: ${missing.length} configured system label filter(s) were not found in Gmail system labels: ` +
+      `[ ${missing.join(", ")} ]`
+    );
+  }
+}
+
+/* ========================================================================== */
+/* Label and skip logic                                                        */
+/* ========================================================================== */
+
+/**
+ * Normalize LOG_LEVEL to a safe value.
+ *
+ * @param {number} level Proposed log level
+ * @returns {number} 1, 2, or 3
+ */
+function normalizeLogLevel(level) {
+  return [1, 2, 3].includes(level) ? level : 1;
+}
+
+/**
+ * Return all ancestor label names for a nested label.
+ *
+ * Example:
+ *   "sport/lax/field" -> ["sport", "sport/lax"]
+ *
+ * @param {string} labelName Nested label name
+ * @returns {string[]} Ancestor label names from highest to nearest parent
+ */
+function getAncestorNames(labelName) {
+  const parts = labelName.split("/");
+  const ancestors = [];
+
+  for (let i = 1; i < parts.length; i++) {
+    ancestors.push(parts.slice(0, i).join("/"));
+  }
+
+  return ancestors;
+}
+
+/**
+ * Determine whether a label should be skipped and why.
+ *
+ * Rules:
+ * - Exact match in LABEL_SKIP_LIST => skip
+ * - Descendant of any OFFSPRING_SKIP_LIST entry => skip
+ *
+ * @param {string} labelName Label to test
+ * @param {Set<string>} skippedLabels Exact labels to skip
+ * @param {string[]} skippedAncestors Ancestor labels whose descendants are skipped
+ * @returns {string|null} Human-readable reason, or null if not skipped
+ */
+function getSkipReason(labelName, skippedLabels, skippedAncestors) {
+  if (skippedLabels.has(labelName)) {
+    return "Label skip list";
+  }
+
+  for (const ancestor of skippedAncestors) {
+    if (labelName.startsWith(ancestor + "/")) {
+      return `Offspring of "${ancestor}"`;
+    }
+  }
+
+  return null;
+}
+
+/* ========================================================================== */
+/* Gmail message search and modify                                             */
+/* ========================================================================== */
+
+/**
+ * Return all message IDs matching a Gmail search query.
+ *
+ * Uses Gmail.Users.Messages.list with pagination until all result pages
+ * have been fetched.
+ *
+ * @param {string} query Gmail search query
+ * @returns {string[]} Matching message IDs
+ */
+function listAllMessageIds(query) {
+  const ids = [];
+  let pageToken = null;
+
+  do {
+    const response = Gmail.Users.Messages.list("me", {
+      q: query,
+      pageToken: pageToken,
+      maxResults: SEARCH_PAGE_SIZE,
+    });
+
+    const messages = response.messages || [];
+    ids.push(...messages.map(message => message.id));
+    pageToken = response.nextPageToken || null;
+  } while (pageToken);
+
+  return ids;
+}
+
+/**
+ * Add/remove labels in Gmail batchModify calls, chunked to Gmail's 1000-ID limit.
+ *
+ * This safe version catches errors per chunk so one failed chunk does not stop
+ * the rest of the run, and retries each failed chunk using exponential backoff.
+ *
+ * @param {string[]} messageIds Message IDs to modify
+ * @param {string[]} addLabelIds Label IDs to add
+ * @param {string[]} removeLabelIds Label IDs to remove
+ * @returns {{batchCount:number, failureCount:number}} Summary of batch attempts
+ */
+function batchModifyMessagesSafe(messageIds, addLabelIds, removeLabelIds) {
+  if (!messageIds || messageIds.length === 0) {
+    return { batchCount: 0, failureCount: 0 };
+  }
+
+  let batchCount = 0;
+  let failureCount = 0;
+
+  for (let i = 0; i < messageIds.length; i += BATCH_MODIFY_SIZE) {
+    const chunk = messageIds.slice(i, i + BATCH_MODIFY_SIZE);
+    batchCount += 1;
+
+    const ok = retryBatchModifyChunk(chunk, addLabelIds || [], removeLabelIds || [], batchCount);
+
+    if (!ok) {
+      failureCount += 1;
+    }
+  }
+
+  return { batchCount, failureCount };
+}
+
+/**
+ * Retry a single batchModify chunk using exponential backoff.
+ *
+ * Attempts up to RETRY_MAX_ATTEMPTS times total.
+ *
+ * @param {string[]} chunk Message IDs for this batch
+ * @param {string[]} addLabelIds Label IDs to add
+ * @param {string[]} removeLabelIds Label IDs to remove
+ * @param {number} batchNumber Human-friendly batch number for logging
+ * @returns {boolean} True on success, false if all attempts fail
+ */
+function retryBatchModifyChunk(chunk, addLabelIds, removeLabelIds, batchNumber) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt++) {
+    try {
+      Gmail.Users.Messages.batchModify(
+        {
+          ids: chunk,
+          addLabelIds: addLabelIds,
+          removeLabelIds: removeLabelIds,
+        },
+        "me"
+      );
+
+      if (attempt === 1) {
+        logDebug(`batchModify success: batch ${batchNumber}, ${chunk.length} message(s).`);
+      } else {
+        logInfo(
+          `batchModify recovered: batch ${batchNumber} succeeded on attempt ${attempt}/${RETRY_MAX_ATTEMPTS}.`
+        );
+      }
+
+      return true;
+    } catch (err) {
+      lastError = err;
+
+      const isLastAttempt = attempt === RETRY_MAX_ATTEMPTS;
+      const message = err && err.message ? err.message : String(err);
+
+      if (isLastAttempt) {
+        logInfo(
+          `batchModify failed permanently for batch ${batchNumber} (${chunk.length} message(s)) ` +
+          `after ${RETRY_MAX_ATTEMPTS} attempt(s): ${message}`
+        );
+        break;
+      }
+
+      const delayMs = RETRY_INITIAL_DELAY_MS * Math.pow(2, attempt - 1);
+
+      logInfo(
+        `batchModify failed for batch ${batchNumber} (${chunk.length} message(s)) on attempt ` +
+        `${attempt}/${RETRY_MAX_ATTEMPTS}: ${message}. Retrying in ${delayMs} ms.`
+      );
+
+      Utilities.sleep(delayMs);
+    }
+  }
+
+  logDebug(
+    `Last error for batch ${batchNumber}: ${lastError && lastError.message ? lastError.message : lastError}`
+  );
+
+  return false;
+}
+
+/* ========================================================================== */
+/* Continuation state and triggers                                             */
+/* ========================================================================== */
+
+/**
+ * Load saved continuation state from Script Properties.
+ *
+ * @returns {Object|null} Parsed state object, or null if none/invalid
+ */
+function loadContinuationState() {
+  const raw = PropertiesService.getScriptProperties().getProperty(STATE_KEY);
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    logInfo(`Could not parse continuation state. Starting over. Error: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Save continuation state to Script Properties.
+ *
+ * @param {Object} state Serializable state object
+ */
+function saveContinuationState(state) {
+  PropertiesService.getScriptProperties().setProperty(STATE_KEY, JSON.stringify(state));
+}
+
+/**
+ * Remove saved continuation state.
+ */
+function clearContinuationState() {
+  PropertiesService.getScriptProperties().deleteProperty(STATE_KEY);
+}
+
+/**
+ * Delete any existing continuation triggers for this script.
+ *
+ * This prevents multiple overlapping time-based triggers from piling up.
+ */
+function deleteContinuationTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+
+  for (const trigger of triggers) {
+    if (trigger.getHandlerFunction() === CONTINUATION_FUNCTION_NAME) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  }
+}
+
+/**
+ * Schedule a time-based continuation trigger.
+ *
+ * Existing continuation triggers are deleted first so only one continuation
+ * trigger remains active at a time.
+ */
+function scheduleContinuationTrigger() {
+  deleteContinuationTriggers();
+
+  ScriptApp.newTrigger(CONTINUATION_FUNCTION_NAME)
+    .timeBased()
+    .after(CONTINUATION_DELAY_MS)
+    .create();
+
+  logInfo(`Continuation trigger scheduled in ${Math.round(CONTINUATION_DELAY_MS / 1000)} second(s).`);
+}
+
+/**
+ * Build state object pointing to the current label/ancestor pair.
+ *
+ * Used when a run stops before processing the current pair.
+ *
+ * @param {string} labelName Current label name
+ * @param {string} ancestorName Current ancestor name
+ * @param {number} labelIndex Current label index
+ * @param {number} ancestorIndex Current ancestor index
+ * @returns {Object} Continuation state
+ */
+function buildContinuationState(labelName, ancestorName, labelIndex, ancestorIndex) {
+  return {
+    labelName,
+    ancestorName,
+    labelIndex,
+    ancestorIndex,
+    savedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Build continuation state for the next logical position after finishing
+ * the current label/ancestor pair.
+ *
+ * @param {Object[]} eligibleLabels Eligible label objects
+ * @param {number} labelIndex Current label index
+ * @param {string[]} ancestorNames Ancestors for current label
+ * @param {number} ancestorIndex Current ancestor index
+ * @returns {Object|null} Continuation state, or null if all work is complete
+ */
+function buildNextPositionAfterCurrent(eligibleLabels, labelIndex, ancestorNames, ancestorIndex) {
+  if (ancestorIndex + 1 < ancestorNames.length) {
+    return {
+      labelName: eligibleLabels[labelIndex].name,
+      ancestorName: ancestorNames[ancestorIndex + 1],
+      labelIndex: labelIndex,
+      ancestorIndex: ancestorIndex + 1,
+      savedAt: new Date().toISOString(),
+    };
+  }
+
+  if (labelIndex + 1 < eligibleLabels.length) {
+    const nextLabelName = eligibleLabels[labelIndex + 1].name;
+    const nextAncestors = getAncestorNames(nextLabelName);
+
+    if (nextAncestors.length > 0) {
+      return {
+        labelName: nextLabelName,
+        ancestorName: nextAncestors[0],
+        labelIndex: labelIndex + 1,
+        ancestorIndex: 0,
+        savedAt: new Date().toISOString(),
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Resolve the resume position from saved state.
+ *
+ * Uses names when possible for resilience across label-order changes, and
+ * falls back to numeric indices when needed.
+ *
+ * @param {Object|null} savedState Previously saved state
+ * @param {Object[]} eligibleLabels Sorted eligible labels
+ * @returns {{labelIndex:number, ancestorIndex:number}}
+ */
+function getStartPosition(savedState, eligibleLabels) {
+  if (!savedState) {
+    return { labelIndex: 0, ancestorIndex: 0 };
+  }
+
+  const labelIndexByName = eligibleLabels.findIndex(label => label.name === savedState.labelName);
+
+  if (labelIndexByName === -1) {
+    logInfo(`Saved resume label "${savedState.labelName}" no longer exists or is no longer eligible. Starting over.`);
+    return { labelIndex: 0, ancestorIndex: 0 };
+  }
+
+  const labelName = eligibleLabels[labelIndexByName].name;
+  const ancestorNames = getAncestorNames(labelName);
+  const ancestorIndexByName = ancestorNames.findIndex(name => name === savedState.ancestorName);
+
+  if (ancestorIndexByName === -1) {
+    logInfo(`Saved resume ancestor "${savedState.ancestorName}" no longer applies to "${labelName}". Starting label from first ancestor.`);
+    return { labelIndex: labelIndexByName, ancestorIndex: 0 };
+  }
+
+  return {
+    labelIndex: labelIndexByName,
+    ancestorIndex: ancestorIndexByName,
+  };
+}
+
+/* ========================================================================== */
+/* Validation and formatting                                                   */
+/* ========================================================================== */
+
+/**
+ * Validate a skip list against current Gmail labels.
+ *
+ * Logs:
+ * - number of entries
+ * - labels that do not exist
+ * - labels that are system labels
+ *
+ * @param {string} listName Human-readable list name
+ * @param {string[]} skipList List values to validate
+ * @param {Set<string>} allLabelNameSet All Gmail label names
+ * @param {Set<string>} systemLabelNameSet System label names
+ */
+function validateSkipList(listName, skipList, allLabelNameSet, systemLabelNameSet) {
+  const missing = skipList.filter(name => !allLabelNameSet.has(name));
+  const system = skipList.filter(name => systemLabelNameSet.has(name));
+
+  let message = `${skipList.length} entr${skipList.length === 1 ? "y" : "ies"} in ${listName} skip list`;
+
+  if (missing.length > 0) {
+    message += `\nMissing labels (${missing.length}): [ ${missing.join(", ")} ]`;
+  }
+
+  if (system.length > 0) {
+    message += `\nSystem labels ignored (${system.length}): [ ${system.join(", ")} ]`;
+  }
+
+  logInfo(message);
+}
+
+/**
+ * Format skip-list matches for verbose output.
+ *
+ * @param {{label:string, reason:string}[]} skipMatches Matched labels with reasons
+ * @returns {string} Formatted multi-line log text
+ */
+function formatSkipMatches(skipMatches) {
+  const width = getPadding(skipMatches.map(item => item.label), 2);
+
+  return [
+    "Gmail user labels that matched a skip list:",
+    ...skipMatches.map((item, index) => {
+      const num = String(index + 1).padStart(3, " ");
+      const label = item.label.padEnd(width, " ");
+      return `${num} ${label}${item.reason}`;
+    }),
+  ].join("\n");
+}
+
+/**
+ * Build a preview log of message IDs touched for one label/ancestor pair.
+ *
+ * @param {string} labelName Child label
+ * @param {string} ancestorName Ancestor label added
+ * @param {string[]} messageIds Updated message IDs
+ * @returns {string} Formatted preview text
+ */
+function buildMessagePreview(labelName, ancestorName, messageIds) {
+  const previewCount = Math.min(messageIds.length, 20);
+  const previewLines = messageIds
+    .slice(0, previewCount)
+    .map(id => `  - ${id}`);
+
+  if (messageIds.length > previewCount) {
+    previewLines.push(`  ...and ${messageIds.length - previewCount} more`);
+  }
+
+  return [
+    `Updated for "${labelName}" -> "${ancestorName}":`,
+    ...previewLines,
+  ].join("\n");
+}
+
+/**
+ * Return width needed to align a column of strings.
+ *
+ * @param {Array<*>} values Values to measure
+ * @param {number} extra Additional padding
+ * @returns {number} Computed width
+ */
+function getPadding(values, extra) {
+  if (!Array.isArray(values) || values.length === 0) {
+    return extra || 1;
+  }
+
+  const longest = values.reduce((max, value) => {
+    return Math.max(max, String(value).length);
+  }, 0);
+
+  return longest + (extra || 1);
+}
+
+/* ========================================================================== */
+/* Logging                                                                     */
+/* ========================================================================== */
+
+/**
+ * Log an info-level message.
+ *
+ * @param {string} message Message text
+ */
+function logInfo(message) {
+  Logger.log(message);
+}
+
+/**
+ * Log a verbose-level message if LOG_LEVEL >= 2.
+ *
+ * @param {string} message Message text
+ */
+function logVerbose(message) {
+  if (normalizeLogLevel(LOG_LEVEL) >= 2) {
+    Logger.log(message);
+  }
+}
+
+/**
+ * Log a debug-level message if LOG_LEVEL >= 3.
+ *
+ * @param {string} message Message text
+ */
+function logDebug(message) {
+  if (normalizeLogLevel(LOG_LEVEL) >= 3) {
+    Logger.log(message);
+  }
 }
